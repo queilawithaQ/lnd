@@ -670,7 +670,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 	// With the announcement generated, we'll sign it to properly
 	// authenticate the message on the network.
 	authSig, err := netann.SignAnnouncement(
-		s.nodeSigner, nodeKeyECDH.PubKey(), nodeAnn,
+		s.nodeSigner, s.identityECDH.PubKey(), nodeAnn,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to generate signature for "+
@@ -725,17 +725,14 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 	// servers, the mission control instance itself can be moved there too.
 	routingConfig := routerrpc.GetRoutingConfig(cfg.SubRPCServers.RouterRPC)
 
-	estimatorCfg := routing.ProbabilityEstimatorCfg{
-		AprioriHopProbability: routingConfig.AprioriHopProbability,
-		PenaltyHalfLife:       routingConfig.PenaltyHalfLife,
-		AprioriWeight:         routingConfig.AprioriWeight,
-	}
-
 	s.missionControl, err = routing.NewMissionControl(
-		remoteChanDB, selfNode.PubKeyBytes,
+		remoteChanDB,
 		&routing.MissionControlConfig{
-			ProbabilityEstimatorCfg: estimatorCfg,
+			AprioriHopProbability:   routingConfig.AprioriHopProbability,
+			PenaltyHalfLife:         routingConfig.PenaltyHalfLife,
 			MaxMcHistory:            routingConfig.MaxMcHistory,
+			AprioriWeight:           routingConfig.AprioriWeight,
+			SelfNode:                selfNode.PubKeyBytes,
 			MinFailureRelaxInterval: routing.DefaultMinFailureRelaxInterval,
 		},
 	)
@@ -823,10 +820,8 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		SubBatchDelay:           time.Second * 5,
 		IgnoreHistoricalFilters: cfg.IgnoreHistoricalGossipFilters,
 		PinnedSyncers:           cfg.Gossip.PinnedSyncers,
-		MaxChannelUpdateBurst:   cfg.Gossip.MaxChannelUpdateBurst,
-		ChannelUpdateInterval:   cfg.Gossip.ChannelUpdateInterval,
 	},
-		nodeKeyECDH.PubKey(),
+		s.identityECDH.PubKey(),
 	)
 
 	s.localChanMgr = &localchans.Manager{
@@ -967,9 +962,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 				return ErrServerShuttingDown
 			}
 		},
-		DisableChannel: func(chanPoint wire.OutPoint) error {
-			return s.chanStatusMgr.RequestDisable(chanPoint, false)
-		},
+		DisableChannel:                s.chanStatusMgr.RequestDisable,
 		Sweeper:                       s.sweeper,
 		Registry:                      s.invoices,
 		NotifyClosedChannel:           s.channelNotifier.NotifyClosedChannelEvent,
@@ -1030,7 +1023,13 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		CurrentNodeAnnouncement: func() (lnwire.NodeAnnouncement, error) {
 			return s.genNodeAnnouncement(true)
 		},
-		SendAnnouncement: s.authGossiper.ProcessLocalAnnouncement,
+		SendAnnouncement: func(msg lnwire.Message,
+			optionalFields ...discovery.OptionalMsgField) chan error {
+
+			return s.authGossiper.ProcessLocalAnnouncement(
+				msg, nodeKeyECDH.PubKey(), optionalFields...,
+			)
+		},
 		NotifyWhenOnline: s.NotifyWhenOnline,
 		TempChanIDSeed:   chanIDSeed,
 		FindChannel: func(chanID lnwire.ChannelID) (
@@ -1413,7 +1412,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		RetryDuration:  time.Second * 5,
 		TargetOutbound: 100,
 		Dial: noiseDial(
-			nodeKeyECDH, s.cfg.net, s.cfg.ConnectionTimeout,
+			s.identityECDH, s.cfg.net, s.cfg.ConnectionTimeout,
 		),
 		OnConnection: s.OutboundPeerConnected,
 	})
@@ -3133,7 +3132,6 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 		UnsafeReplay:            s.cfg.UnsafeReplay,
 		MaxOutgoingCltvExpiry:   s.cfg.MaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation: s.cfg.MaxChannelFeeAllocation,
-		CoopCloseTargetConfs:    s.cfg.CoopCloseTargetConfs,
 		MaxAnchorsCommitFeeRate: chainfee.SatPerKVByte(
 			s.cfg.MaxCommitFeeRateAnchors * 1000).FeePerKWeight(),
 		Quit: s.quit,
@@ -3791,7 +3789,8 @@ func (s *server) fetchLastChanUpdate() func(lnwire.ShortChannelID) (
 // applyChannelUpdate applies the channel update to the different sub-systems of
 // the server.
 func (s *server) applyChannelUpdate(update *lnwire.ChannelUpdate) error {
-	errChan := s.authGossiper.ProcessLocalAnnouncement(update)
+	pubKey := s.identityECDH.PubKey()
+	errChan := s.authGossiper.ProcessLocalAnnouncement(update, pubKey)
 	select {
 	case err := <-errChan:
 		return err
