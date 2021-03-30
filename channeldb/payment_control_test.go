@@ -1,23 +1,33 @@
 package channeldb
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/record"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
+
+func initDB() (*DB, error) {
+	tempPath, err := ioutil.TempDir("", "switchdb")
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := Open(tempPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return db, err
+}
 
 func genPreimage() ([32]byte, error) {
 	var preimage [32]byte
@@ -56,8 +66,7 @@ func genInfo() (*PaymentCreationInfo, *HTLCAttemptInfo,
 func TestPaymentControlSwitchFail(t *testing.T) {
 	t.Parallel()
 
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
+	db, err := initDB()
 	if err != nil {
 		t.Fatalf("unable to init db: %v", err)
 	}
@@ -75,7 +84,6 @@ func TestPaymentControlSwitchFail(t *testing.T) {
 		t.Fatalf("unable to send htlc message: %v", err)
 	}
 
-	assertPaymentIndex(t, pControl, info.PaymentHash)
 	assertPaymentStatus(t, pControl, info.PaymentHash, StatusInFlight)
 	assertPaymentInfo(
 		t, pControl, info.PaymentHash, info, nil, nil,
@@ -94,22 +102,12 @@ func TestPaymentControlSwitchFail(t *testing.T) {
 		t, pControl, info.PaymentHash, info, &failReason, nil,
 	)
 
-	// Lookup the payment so we can get its old sequence number before it is
-	// overwritten.
-	payment, err := pControl.FetchPayment(info.PaymentHash)
-	assert.NoError(t, err)
-
 	// Sends the htlc again, which should succeed since the prior payment
 	// failed.
 	err = pControl.InitPayment(info.PaymentHash, info)
 	if err != nil {
 		t.Fatalf("unable to send htlc message: %v", err)
 	}
-
-	// Check that our index has been updated, and the old index has been
-	// removed.
-	assertPaymentIndex(t, pControl, info.PaymentHash)
-	assertNoIndex(t, pControl, payment.SequenceNum)
 
 	assertPaymentStatus(t, pControl, info.PaymentHash, StatusInFlight)
 	assertPaymentInfo(
@@ -161,6 +159,7 @@ func TestPaymentControlSwitchFail(t *testing.T) {
 
 	// Settle the attempt and verify that status was changed to
 	// StatusSucceeded.
+	var payment *MPPayment
 	payment, err = pControl.SettleAttempt(
 		info.PaymentHash, attempt.AttemptID,
 		&HTLCSettleInfo{
@@ -203,9 +202,7 @@ func TestPaymentControlSwitchFail(t *testing.T) {
 func TestPaymentControlSwitchDoubleSend(t *testing.T) {
 	t.Parallel()
 
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
-
+	db, err := initDB()
 	if err != nil {
 		t.Fatalf("unable to init db: %v", err)
 	}
@@ -224,7 +221,6 @@ func TestPaymentControlSwitchDoubleSend(t *testing.T) {
 		t.Fatalf("unable to send htlc message: %v", err)
 	}
 
-	assertPaymentIndex(t, pControl, info.PaymentHash)
 	assertPaymentStatus(t, pControl, info.PaymentHash, StatusInFlight)
 	assertPaymentInfo(
 		t, pControl, info.PaymentHash, info, nil, nil,
@@ -286,9 +282,7 @@ func TestPaymentControlSwitchDoubleSend(t *testing.T) {
 func TestPaymentControlSuccessesWithoutInFlight(t *testing.T) {
 	t.Parallel()
 
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
-
+	db, err := initDB()
 	if err != nil {
 		t.Fatalf("unable to init db: %v", err)
 	}
@@ -319,9 +313,7 @@ func TestPaymentControlSuccessesWithoutInFlight(t *testing.T) {
 func TestPaymentControlFailsWithoutInFlight(t *testing.T) {
 	t.Parallel()
 
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
-
+	db, err := initDB()
 	if err != nil {
 		t.Fatalf("unable to init db: %v", err)
 	}
@@ -342,53 +334,35 @@ func TestPaymentControlFailsWithoutInFlight(t *testing.T) {
 	assertPaymentStatus(t, pControl, info.PaymentHash, StatusUnknown)
 }
 
-// TestPaymentControlDeleteNonInFlight checks that calling DeletePayments only
+// TestPaymentControlDeleteNonInFlight checks that calling DeletaPayments only
 // deletes payments from the database that are not in-flight.
 func TestPaymentControlDeleteNonInFligt(t *testing.T) {
 	t.Parallel()
 
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
-
+	db, err := initDB()
 	if err != nil {
 		t.Fatalf("unable to init db: %v", err)
 	}
 
-	// Create a sequence number for duplicate payments that will not collide
-	// with the sequence numbers for the payments we create. These values
-	// start at 1, so 9999 is a safe bet for this test.
-	var duplicateSeqNr = 9999
-
 	pControl := NewPaymentControl(db)
 
 	payments := []struct {
-		failed       bool
-		success      bool
-		hasDuplicate bool
+		failed  bool
+		success bool
 	}{
 		{
-			failed:       true,
-			success:      false,
-			hasDuplicate: false,
+			failed:  true,
+			success: false,
 		},
 		{
-			failed:       false,
-			success:      true,
-			hasDuplicate: false,
+			failed:  false,
+			success: true,
 		},
 		{
-			failed:       false,
-			success:      false,
-			hasDuplicate: false,
-		},
-		{
-			failed:       false,
-			success:      true,
-			hasDuplicate: true,
+			failed:  false,
+			success: false,
 		},
 	}
-
-	var numSuccess, numInflight int
 
 	for _, p := range payments {
 		info, attempt, preimg, err := genInfo()
@@ -456,318 +430,33 @@ func TestPaymentControlDeleteNonInFligt(t *testing.T) {
 			assertPaymentInfo(
 				t, pControl, info.PaymentHash, info, nil, htlc,
 			)
-
-			numSuccess++
 		} else {
 			assertPaymentStatus(t, pControl, info.PaymentHash, StatusInFlight)
 			assertPaymentInfo(
 				t, pControl, info.PaymentHash, info, nil, htlc,
 			)
-
-			numInflight++
-		}
-
-		// If the payment is intended to have a duplicate payment, we
-		// add one.
-		if p.hasDuplicate {
-			appendDuplicatePayment(
-				t, pControl.db, info.PaymentHash,
-				uint64(duplicateSeqNr), preimg,
-			)
-			duplicateSeqNr++
-			numSuccess++
 		}
 	}
 
-	// Delete all failed payments.
-	if err := db.DeletePayments(true, false); err != nil {
+	// Delete payments.
+	if err := db.DeletePayments(); err != nil {
 		t.Fatal(err)
 	}
 
-	// This should leave the succeeded and in-flight payments.
+	// This should leave the in-flight payment.
 	dbPayments, err := db.FetchPayments()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(dbPayments) != numSuccess+numInflight {
-		t.Fatalf("expected %d payments, got %d",
-			numSuccess+numInflight, len(dbPayments))
+	if len(dbPayments) != 1 {
+		t.Fatalf("expected one payment, got %d", len(dbPayments))
 	}
 
-	var s, i int
-	for _, p := range dbPayments {
-		fmt.Println("fetch payment has status", p.Status)
-		switch p.Status {
-		case StatusSucceeded:
-			s++
-		case StatusInFlight:
-			i++
-		}
+	status := dbPayments[0].Status
+	if status != StatusInFlight {
+		t.Fatalf("expected in-fligth status, got %v", status)
 	}
-
-	if s != numSuccess {
-		t.Fatalf("expected %d succeeded payments , got %d",
-			numSuccess, s)
-	}
-	if i != numInflight {
-		t.Fatalf("expected %d in-flight payments, got %d",
-			numInflight, i)
-	}
-
-	// Now delete all payments except in-flight.
-	if err := db.DeletePayments(false, false); err != nil {
-		t.Fatal(err)
-	}
-
-	// This should leave the in-flight payment.
-	dbPayments, err = db.FetchPayments()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(dbPayments) != numInflight {
-		t.Fatalf("expected %d payments, got %d", numInflight,
-			len(dbPayments))
-	}
-
-	for _, p := range dbPayments {
-		if p.Status != StatusInFlight {
-			t.Fatalf("expected in-fligth status, got %v", p.Status)
-		}
-	}
-
-	// Finally, check that we only have a single index left in the payment
-	// index bucket.
-	var indexCount int
-	err = kvdb.View(db, func(tx walletdb.ReadTx) error {
-		index := tx.ReadBucket(paymentsIndexBucket)
-
-		return index.ForEach(func(k, v []byte) error {
-			indexCount++
-			return nil
-		})
-	}, func() { indexCount = 0 })
-	require.NoError(t, err)
-
-	require.Equal(t, 1, indexCount)
-}
-
-// TestPaymentControlDeletePayments tests that DeletePayments correcly deletes
-// information about completed payments from the database.
-func TestPaymentControlDeletePayments(t *testing.T) {
-	t.Parallel()
-
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
-
-	if err != nil {
-		t.Fatalf("unable to init db: %v", err)
-	}
-
-	pControl := NewPaymentControl(db)
-
-	// Register three payments:
-	// 1. A payment with two failed attempts.
-	// 2. A Payment with one failed and one settled attempt.
-	// 3. A payment with one failed and one in-flight attempt.
-	attemptID := uint64(0)
-	for i := 0; i < 3; i++ {
-		info, attempt, preimg, err := genInfo()
-		if err != nil {
-			t.Fatalf("unable to generate htlc message: %v", err)
-		}
-
-		attempt.AttemptID = attemptID
-		attemptID++
-
-		// Init the payment.
-		err = pControl.InitPayment(info.PaymentHash, info)
-		if err != nil {
-			t.Fatalf("unable to send htlc message: %v", err)
-		}
-
-		// Register and fail the first attempt for all three payments.
-		_, err = pControl.RegisterAttempt(info.PaymentHash, attempt)
-		if err != nil {
-			t.Fatalf("unable to send htlc message: %v", err)
-		}
-
-		htlcFailure := HTLCFailUnreadable
-		_, err = pControl.FailAttempt(
-			info.PaymentHash, attempt.AttemptID,
-			&HTLCFailInfo{
-				Reason: htlcFailure,
-			},
-		)
-		if err != nil {
-			t.Fatalf("unable to fail htlc: %v", err)
-		}
-
-		// Depending on the test case, fail or succeed the next
-		// attempt.
-		attempt.AttemptID = attemptID
-		attemptID++
-
-		_, err = pControl.RegisterAttempt(info.PaymentHash, attempt)
-		if err != nil {
-			t.Fatalf("unable to send htlc message: %v", err)
-		}
-
-		switch i {
-
-		// Fail the attempt and the payment overall.
-		case 0:
-			htlcFailure := HTLCFailUnreadable
-			_, err = pControl.FailAttempt(
-				info.PaymentHash, attempt.AttemptID,
-				&HTLCFailInfo{
-					Reason: htlcFailure,
-				},
-			)
-			if err != nil {
-				t.Fatalf("unable to fail htlc: %v", err)
-			}
-
-			failReason := FailureReasonNoRoute
-			_, err = pControl.Fail(info.PaymentHash, failReason)
-			if err != nil {
-				t.Fatalf("unable to fail payment hash: %v", err)
-			}
-
-		// Settle the attempt
-		case 1:
-			_, err := pControl.SettleAttempt(
-				info.PaymentHash, attempt.AttemptID,
-				&HTLCSettleInfo{
-					Preimage: preimg,
-				},
-			)
-			if err != nil {
-				t.Fatalf("error shouldn't have been received, got: %v", err)
-			}
-
-		// We leave the attmpet in-flight by doing nothing.
-		case 2:
-		}
-	}
-
-	type fetchedPayment struct {
-		status PaymentStatus
-		htlcs  int
-	}
-
-	assertPayments := func(expPayments []fetchedPayment) {
-		t.Helper()
-
-		dbPayments, err := db.FetchPayments()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if len(dbPayments) != len(expPayments) {
-			t.Fatalf("expected %d payments, got %d",
-				len(expPayments), len(dbPayments))
-		}
-
-		for i := range dbPayments {
-			if dbPayments[i].Status != expPayments[i].status {
-				t.Fatalf("unexpected payment status")
-			}
-
-			if len(dbPayments[i].HTLCs) != expPayments[i].htlcs {
-				t.Fatalf("unexpected number of htlcs")
-			}
-
-		}
-	}
-
-	// Check that all payments are there as we added them.
-	assertPayments([]fetchedPayment{
-		{
-			status: StatusFailed,
-			htlcs:  2,
-		},
-		{
-			status: StatusSucceeded,
-			htlcs:  2,
-		},
-		{
-			status: StatusInFlight,
-			htlcs:  2,
-		},
-	})
-
-	// Delete HTLC attempts for failed payments only.
-	if err := db.DeletePayments(true, true); err != nil {
-		t.Fatal(err)
-	}
-
-	// The failed payment is the only altered one.
-	assertPayments([]fetchedPayment{
-		{
-			status: StatusFailed,
-			htlcs:  0,
-		},
-		{
-			status: StatusSucceeded,
-			htlcs:  2,
-		},
-		{
-			status: StatusInFlight,
-			htlcs:  2,
-		},
-	})
-
-	// Delete failed attempts for all payments.
-	if err := db.DeletePayments(false, true); err != nil {
-		t.Fatal(err)
-	}
-
-	// The failed attempts should be deleted, except for the in-flight
-	// payment, that shouldn't be altered until it has completed.
-	assertPayments([]fetchedPayment{
-		{
-			status: StatusFailed,
-			htlcs:  0,
-		},
-		{
-			status: StatusSucceeded,
-			htlcs:  1,
-		},
-		{
-			status: StatusInFlight,
-			htlcs:  2,
-		},
-	})
-
-	// Now delete all failed payments.
-	if err := db.DeletePayments(true, false); err != nil {
-		t.Fatal(err)
-	}
-
-	assertPayments([]fetchedPayment{
-		{
-			status: StatusSucceeded,
-			htlcs:  1,
-		},
-		{
-			status: StatusInFlight,
-			htlcs:  2,
-		},
-	})
-
-	// Finally delete all completed payments.
-	if err := db.DeletePayments(false, false); err != nil {
-		t.Fatal(err)
-	}
-
-	assertPayments([]fetchedPayment{
-		{
-			status: StatusInFlight,
-			htlcs:  2,
-		},
-	})
 }
 
 // TestPaymentControlMultiShard checks the ability of payment control to
@@ -792,9 +481,7 @@ func TestPaymentControlMultiShard(t *testing.T) {
 	}
 
 	runSubTest := func(t *testing.T, test testCase) {
-		db, cleanup, err := MakeTestDB()
-		defer cleanup()
-
+		db, err := initDB()
 		if err != nil {
 			t.Fatalf("unable to init db: %v", err)
 		}
@@ -812,7 +499,6 @@ func TestPaymentControlMultiShard(t *testing.T) {
 			t.Fatalf("unable to send htlc message: %v", err)
 		}
 
-		assertPaymentIndex(t, pControl, info.PaymentHash)
 		assertPaymentStatus(t, pControl, info.PaymentHash, StatusInFlight)
 		assertPaymentInfo(
 			t, pControl, info.PaymentHash, info, nil, nil,
@@ -1042,9 +728,7 @@ func TestPaymentControlMultiShard(t *testing.T) {
 func TestPaymentControlMPPRecordValidation(t *testing.T) {
 	t.Parallel()
 
-	db, cleanup, err := MakeTestDB()
-	defer cleanup()
-
+	db, err := initDB()
 	if err != nil {
 		t.Fatalf("unable to init db: %v", err)
 	}
@@ -1227,57 +911,4 @@ func assertPaymentInfo(t *testing.T, p *PaymentControl, hash lntypes.Hash,
 	} else if htlc.Settle != nil {
 		t.Fatal("expected no settle info")
 	}
-}
-
-// fetchPaymentIndexEntry gets the payment hash for the sequence number provided
-// from our payment indexes bucket.
-func fetchPaymentIndexEntry(_ *testing.T, p *PaymentControl,
-	sequenceNumber uint64) (*lntypes.Hash, error) {
-
-	var hash lntypes.Hash
-
-	if err := kvdb.View(p.db, func(tx walletdb.ReadTx) error {
-		indexBucket := tx.ReadBucket(paymentsIndexBucket)
-		key := make([]byte, 8)
-		byteOrder.PutUint64(key, sequenceNumber)
-
-		indexValue := indexBucket.Get(key)
-		if indexValue == nil {
-			return errNoSequenceNrIndex
-		}
-
-		r := bytes.NewReader(indexValue)
-
-		var err error
-		hash, err = deserializePaymentIndex(r)
-		return err
-	}, func() {
-		hash = lntypes.Hash{}
-	}); err != nil {
-		return nil, err
-	}
-
-	return &hash, nil
-}
-
-// assertPaymentIndex looks up the index for a payment in the db and checks
-// that its payment hash matches the expected hash passed in.
-func assertPaymentIndex(t *testing.T, p *PaymentControl,
-	expectedHash lntypes.Hash) {
-
-	// Lookup the payment so that we have its sequence number and check
-	// that is has correctly been indexed in the payment indexes bucket.
-	pmt, err := p.FetchPayment(expectedHash)
-	require.NoError(t, err)
-
-	hash, err := fetchPaymentIndexEntry(t, p, pmt.SequenceNum)
-	require.NoError(t, err)
-	assert.Equal(t, expectedHash, *hash)
-}
-
-// assertNoIndex checks that an index for the sequence number provided does not
-// exist.
-func assertNoIndex(t *testing.T, p *PaymentControl, seqNr uint64) {
-	_, err := fetchPaymentIndexEntry(t, p, seqNr)
-	require.Equal(t, errNoSequenceNrIndex, err)
 }

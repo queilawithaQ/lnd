@@ -3,7 +3,6 @@ package channeldb
 import (
 	"bytes"
 	"io/ioutil"
-	"os"
 	"testing"
 
 	"github.com/go-errors/errors"
@@ -15,7 +14,7 @@ import (
 func applyMigration(t *testing.T, beforeMigration, afterMigration func(d *DB),
 	migrationFunc migration, shouldFail bool, dryRun bool) {
 
-	cdb, cleanUp, err := MakeTestDB()
+	cdb, cleanUp, err := makeTestDB()
 	defer cleanUp()
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +85,7 @@ func applyMigration(t *testing.T, beforeMigration, afterMigration func(d *DB),
 func TestVersionFetchPut(t *testing.T) {
 	t.Parallel()
 
-	db, cleanUp, err := MakeTestDB()
+	db, cleanUp, err := makeTestDB()
 	defer cleanUp()
 	if err != nil {
 		t.Fatal(err)
@@ -209,7 +208,7 @@ func TestMigrationWithPanic(t *testing.T) {
 			}
 
 			return bucket.Put(keyPrefix, beforeMigration)
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatalf("unable to insert: %v", err)
 		}
@@ -251,7 +250,7 @@ func TestMigrationWithPanic(t *testing.T) {
 			}
 
 			return nil
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,7 +282,7 @@ func TestMigrationWithFatal(t *testing.T) {
 			}
 
 			return bucket.Put(keyPrefix, beforeMigration)
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatalf("unable to insert pre migration key: %v", err)
 		}
@@ -326,7 +325,7 @@ func TestMigrationWithFatal(t *testing.T) {
 			}
 
 			return nil
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -359,7 +358,7 @@ func TestMigrationWithoutErrors(t *testing.T) {
 			}
 
 			return bucket.Put(keyPrefix, beforeMigration)
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatalf("unable to update db pre migration: %v", err)
 		}
@@ -401,7 +400,7 @@ func TestMigrationWithoutErrors(t *testing.T) {
 			}
 
 			return nil
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -422,21 +421,12 @@ func TestMigrationReversion(t *testing.T) {
 	t.Parallel()
 
 	tempDirName, err := ioutil.TempDir("", "channeldb")
-	defer func() {
-		os.RemoveAll(tempDirName)
-	}()
 	if err != nil {
 		t.Fatalf("unable to create temp dir: %v", err)
 	}
 
-	backend, cleanup, err := kvdb.GetTestBackend(tempDirName, "cdb")
+	cdb, err := Open(tempDirName)
 	if err != nil {
-		t.Fatalf("unable to get test db backend: %v", err)
-	}
-
-	cdb, err := CreateWithBackend(backend)
-	if err != nil {
-		cleanup()
 		t.Fatalf("unable to open channeldb: %v", err)
 	}
 
@@ -448,23 +438,16 @@ func TestMigrationReversion(t *testing.T) {
 		}
 
 		return putMeta(newMeta, tx)
-	}, func() {})
+	})
 
 	// Close the database. Even if we succeeded, our next step is to reopen.
 	cdb.Close()
-	cleanup()
 
 	if err != nil {
 		t.Fatalf("unable to increase db version: %v", err)
 	}
 
-	backend, cleanup, err = kvdb.GetTestBackend(tempDirName, "cdb")
-	if err != nil {
-		t.Fatalf("unable to get test db backend: %v", err)
-	}
-	defer cleanup()
-
-	_, err = CreateWithBackend(backend)
+	_, err = Open(tempDirName)
 	if err != ErrDBReversion {
 		t.Fatalf("unexpected error when opening channeldb, "+
 			"want: %v, got: %v", ErrDBReversion, err)
@@ -481,7 +464,7 @@ func TestMigrationDryRun(t *testing.T) {
 
 	// Check that version of database version is not modified.
 	afterMigrationFunc := func(d *DB) {
-		err := kvdb.View(d, func(tx kvdb.RTx) error {
+		err := kvdb.View(d, func(tx kvdb.ReadTx) error {
 			meta, err := d.FetchMeta(nil)
 			if err != nil {
 				t.Fatal(err)
@@ -492,7 +475,7 @@ func TestMigrationDryRun(t *testing.T) {
 			}
 
 			return nil
-		}, func() {})
+		})
 		if err != nil {
 			t.Fatalf("unable to apply after func: %v", err)
 		}

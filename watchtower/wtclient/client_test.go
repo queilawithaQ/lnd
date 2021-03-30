@@ -1,3 +1,5 @@
+// +build dev
+
 package wtclient_test
 
 import (
@@ -12,19 +14,16 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/tor"
 	"github.com/lightningnetwork/lnd/watchtower/blob"
 	"github.com/lightningnetwork/lnd/watchtower/wtclient"
 	"github.com/lightningnetwork/lnd/watchtower/wtdb"
 	"github.com/lightningnetwork/lnd/watchtower/wtmock"
 	"github.com/lightningnetwork/lnd/watchtower/wtpolicy"
 	"github.com/lightningnetwork/lnd/watchtower/wtserver"
-	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -86,9 +85,7 @@ func newMockNet(cb func(wtserver.Peer)) *mockNet {
 	}
 }
 
-func (m *mockNet) Dial(network string, address string,
-	timeout time.Duration) (net.Conn, error) {
-
+func (m *mockNet) Dial(network string, address string) (net.Conn, error) {
 	return nil, nil
 }
 
@@ -104,11 +101,10 @@ func (m *mockNet) ResolveTCPAddr(network string, address string) (*net.TCPAddr, 
 	panic("not implemented")
 }
 
-func (m *mockNet) AuthDial(local keychain.SingleKeyECDH,
-	netAddr *lnwire.NetAddress,
-	dialer tor.DialFunc) (wtserver.Peer, error) {
+func (m *mockNet) AuthDial(localPriv *btcec.PrivateKey, netAddr *lnwire.NetAddress,
+	dialer func(string, string) (net.Conn, error)) (wtserver.Peer, error) {
 
-	localPk := local.PubKey()
+	localPk := localPriv.PubKey()
 	localAddr := &net.TCPAddr{
 		IP:   net.IP{0x32, 0x31, 0x30, 0x29},
 		Port: 36723,
@@ -405,7 +401,6 @@ func newHarness(t *testing.T, cfg harnessCfg) *testHarness {
 	if err != nil {
 		t.Fatalf("Unable to generate tower private key: %v", err)
 	}
-	privKeyECDH := &keychain.PrivKeyECDH{PrivKey: privKey}
 
 	towerPubKey := privKey.PubKey()
 
@@ -421,7 +416,7 @@ func newHarness(t *testing.T, cfg harnessCfg) *testHarness {
 		DB:           serverDB,
 		ReadTimeout:  timeout,
 		WriteTimeout: timeout,
-		NodeKeyECDH:  privKeyECDH,
+		NodePrivKey:  privKey,
 		NewAddress: func() (btcutil.Address, error) {
 			return addr, nil
 		},
@@ -438,8 +433,10 @@ func newHarness(t *testing.T, cfg harnessCfg) *testHarness {
 	clientDB := wtmock.NewClientDB()
 
 	clientCfg := &wtclient.Config{
-		Signer:        signer,
-		Dial:          mockNet.Dial,
+		Signer: signer,
+		Dial: func(string, string) (net.Conn, error) {
+			return nil, nil
+		},
 		DB:            clientDB,
 		AuthDial:      mockNet.AuthDial,
 		SecretKeyRing: wtmock.NewSecretKeyRing(),
@@ -447,11 +444,10 @@ func newHarness(t *testing.T, cfg harnessCfg) *testHarness {
 		NewAddress: func() ([]byte, error) {
 			return addrScript, nil
 		},
-		ReadTimeout:    timeout,
-		WriteTimeout:   timeout,
-		MinBackoff:     time.Millisecond,
-		MaxBackoff:     time.Second,
-		ForceQuitDelay: 10 * time.Second,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
+		MinBackoff:   time.Millisecond,
+		MaxBackoff:   10 * time.Millisecond,
 	}
 	client, err := wtclient.New(clientCfg)
 	if err != nil {
@@ -523,7 +519,7 @@ func (h *testHarness) startClient() {
 		h.t.Fatalf("Unable to resolve tower TCP addr: %v", err)
 	}
 	towerAddr := &lnwire.NetAddress{
-		IdentityKey: h.serverCfg.NodeKeyECDH.PubKey(),
+		IdentityKey: h.serverCfg.NodePrivKey.PubKey(),
 		Address:     towerTCPAddr,
 	}
 
@@ -634,7 +630,7 @@ func (h *testHarness) backupState(id, i uint64, expErr error) {
 	_, retribution := h.channel(id).getState(i)
 
 	chanID := chanIDFromInt(id)
-	err := h.client.BackupState(&chanID, retribution, channeldb.SingleFunderBit)
+	err := h.client.BackupState(&chanID, retribution, false)
 	if err != expErr {
 		h.t.Fatalf("back error mismatch, want: %v, got: %v",
 			expErr, err)
@@ -1460,8 +1456,7 @@ var clientTests = []clientTest{
 			// Re-add the tower. We prevent the tower from acking
 			// session creation to ensure the inactive sessions are
 			// not used.
-			err := h.server.Stop()
-			require.Nil(h.t, err)
+			h.server.Stop()
 			h.serverCfg.NoAckCreateSession = true
 			h.startServer()
 			h.addTower(h.serverAddr)
@@ -1470,66 +1465,10 @@ var clientTests = []clientTest{
 			// Finally, allow the tower to ack session creation,
 			// allowing the state updates to be sent through the new
 			// session.
-			err = h.server.Stop()
-			require.Nil(h.t, err)
+			h.server.Stop()
 			h.serverCfg.NoAckCreateSession = false
 			h.startServer()
 			h.waitServerUpdates(hints[numUpdates/2:], 5*time.Second)
-		},
-	},
-	{
-		// Asserts that the client's force quite delay will properly
-		// shutdown the client if it is unable to completely drain the
-		// task pipeline.
-		name: "force unclean shutdown",
-		cfg: harnessCfg{
-			localBalance:  localBalance,
-			remoteBalance: remoteBalance,
-			policy: wtpolicy.Policy{
-				TxPolicy: wtpolicy.TxPolicy{
-					BlobType:     blob.TypeAltruistCommit,
-					SweepFeeRate: wtpolicy.DefaultSweepFeeRate,
-				},
-				MaxUpdates: 5,
-			},
-		},
-		fn: func(h *testHarness) {
-			const (
-				chanID     = 0
-				numUpdates = 6
-				maxUpdates = 5
-			)
-
-			// Advance the channel to create all states.
-			hints := h.advanceChannelN(chanID, numUpdates)
-
-			// Back up 4 of the 5 states for the negotiated session.
-			h.backupStates(chanID, 0, maxUpdates-1, nil)
-			h.waitServerUpdates(hints[:maxUpdates-1], 5*time.Second)
-
-			// Now, restart the tower and prevent it from acking any
-			// new sessions. We do this here as once the last slot
-			// is exhausted the client will attempt to renegotiate.
-			err := h.server.Stop()
-			require.Nil(h.t, err)
-			h.serverCfg.NoAckCreateSession = true
-			h.startServer()
-
-			// Back up the remaining two states. Once the first is
-			// processed, the session will be exhausted but the
-			// client won't be able to regnegotiate a session for
-			// the final state. We'll only wait for the first five
-			// states to arrive at the tower.
-			h.backupStates(chanID, maxUpdates-1, numUpdates, nil)
-			h.waitServerUpdates(hints[:maxUpdates], 5*time.Second)
-
-			// Finally, stop the client which will continue to
-			// attempt session negotiation since it has one more
-			// state to process. After the force quite delay
-			// expires, the client should force quite itself and
-			// allow the test to complete.
-			err = h.client.Stop()
-			require.Nil(h.t, err)
 		},
 	},
 }

@@ -2,7 +2,7 @@ package htlcswitch
 
 import (
 	"bytes"
-	crand "crypto/rand"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -29,8 +29,6 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnpeer"
-	"github.com/lightningnetwork/lnd/lntest/channels"
-	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -55,6 +53,40 @@ var (
 		"5445068131219452686511677818569431", 10)
 	_, _ = testSig.S.SetString("1880105606924982582529128710493133386286603"+
 		"3135609736119018462340006816851118", 10)
+
+	// testTx is used as the default funding txn for single-funder channels.
+	testTx = &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  chainhash.Hash{},
+					Index: 0xffffffff,
+				},
+				SignatureScript: []byte{0x04, 0x31, 0xdc, 0x00, 0x1b, 0x01, 0x62},
+				Sequence:        0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value: 5000000000,
+				PkScript: []byte{
+					0x41, // OP_DATA_65
+					0x04, 0xd6, 0x4b, 0xdf, 0xd0, 0x9e, 0xb1, 0xc5,
+					0xfe, 0x29, 0x5a, 0xbd, 0xeb, 0x1d, 0xca, 0x42,
+					0x81, 0xbe, 0x98, 0x8e, 0x2d, 0xa0, 0xb6, 0xc1,
+					0xc6, 0xa5, 0x9d, 0xc2, 0x26, 0xc2, 0x86, 0x24,
+					0xe1, 0x81, 0x75, 0xe8, 0x51, 0xc9, 0x6b, 0x97,
+					0x3d, 0x81, 0xb0, 0x1c, 0xc3, 0x1f, 0x04, 0x78,
+					0x34, 0xbc, 0x06, 0xd6, 0xd6, 0xed, 0xf6, 0x20,
+					0xd1, 0x84, 0x24, 0x1a, 0x6a, 0xed, 0x8b, 0x63,
+					0xa6, // 65-byte signature
+					0xac, // OP_CHECKSIG
+				},
+			},
+		},
+		LockTime: 5,
+	}
 
 	testBatchTimeout = 50 * time.Millisecond
 )
@@ -105,7 +137,7 @@ func generateRandomBytes(n int) ([]byte, error) {
 	// TODO(roasbeef): should use counter in tests (atomic) rather than
 	// this
 
-	_, err := crand.Read(b)
+	_, err := rand.Read(b[:])
 	// Note that Err == nil only if we read len(b) bytes.
 	if err != nil {
 		return nil, err
@@ -308,7 +340,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		ShortChannelID:          chanID,
 		Db:                      dbAlice,
 		Packager:                channeldb.NewChannelPackager(chanID),
-		FundingTxn:              channels.TestFundingTx,
+		FundingTxn:              testTx,
 	}
 
 	bobChannelState := &channeldb.OpenChannel{
@@ -344,8 +376,8 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		os.RemoveAll(alicePath)
 	}
 
-	aliceSigner := &mock.SingleSigner{Privkey: aliceKeyPriv}
-	bobSigner := &mock.SingleSigner{Privkey: bobKeyPriv}
+	aliceSigner := &mockSigner{aliceKeyPriv}
+	bobSigner := &mockSigner{bobKeyPriv}
 
 	alicePool := lnwallet.NewSigPool(runtime.NumCPU(), aliceSigner)
 	channelAlice, err := lnwallet.NewLightningChannel(
@@ -515,8 +547,8 @@ func getChanID(msg lnwire.Message) (lnwire.ChannelID, error) {
 // invoice which should be added by destination peer.
 func generatePaymentWithPreimage(invoiceAmt, htlcAmt lnwire.MilliSatoshi,
 	timelock uint32, blob [lnwire.OnionPacketSize]byte,
-	preimage *lntypes.Preimage, rhash, payAddr [32]byte) (
-	*channeldb.Invoice, *lnwire.UpdateAddHTLC, uint64, error) {
+	preimage, rhash [32]byte) (*channeldb.Invoice, *lnwire.UpdateAddHTLC,
+	uint64, error) {
 
 	// Create the db invoice. Normally the payment requests needs to be set,
 	// because it is decoded in InvoiceRegistry to obtain the cltv expiry.
@@ -524,19 +556,16 @@ func generatePaymentWithPreimage(invoiceAmt, htlcAmt lnwire.MilliSatoshi,
 	// step and always returning the value of testInvoiceCltvExpiry, we
 	// don't need to bother here with creating and signing a payment
 	// request.
-
 	invoice := &channeldb.Invoice{
 		CreationDate: time.Now(),
 		Terms: channeldb.ContractTerm{
 			FinalCltvDelta:  testInvoiceCltvExpiry,
 			Value:           invoiceAmt,
 			PaymentPreimage: preimage,
-			PaymentAddr:     payAddr,
 			Features: lnwire.NewFeatureVector(
 				nil, lnwire.Features,
 			),
 		},
-		HodlInvoice: preimage == nil,
 	}
 
 	htlc := &lnwire.UpdateAddHTLC{
@@ -561,7 +590,7 @@ func generatePayment(invoiceAmt, htlcAmt lnwire.MilliSatoshi, timelock uint32,
 	blob [lnwire.OnionPacketSize]byte) (*channeldb.Invoice,
 	*lnwire.UpdateAddHTLC, uint64, error) {
 
-	var preimage lntypes.Preimage
+	var preimage [sha256.Size]byte
 	r, err := generateRandomBytes(sha256.Size)
 	if err != nil {
 		return nil, nil, 0, err
@@ -569,16 +598,8 @@ func generatePayment(invoiceAmt, htlcAmt lnwire.MilliSatoshi, timelock uint32,
 	copy(preimage[:], r)
 
 	rhash := sha256.Sum256(preimage[:])
-
-	var payAddr [sha256.Size]byte
-	r, err = generateRandomBytes(sha256.Size)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	copy(payAddr[:], r)
-
 	return generatePaymentWithPreimage(
-		invoiceAmt, htlcAmt, timelock, blob, &preimage, rhash, payAddr,
+		invoiceAmt, htlcAmt, timelock, blob, preimage, rhash,
 	)
 }
 
@@ -1098,8 +1119,13 @@ func newHopNetwork() *hopNetwork {
 	}
 	obfuscator := NewMockObfuscator()
 
+	feeEstimator := &mockFeeEstimator{
+		byteFeeIn: make(chan chainfee.SatPerKWeight),
+		quit:      make(chan struct{}),
+	}
+
 	return &hopNetwork{
-		feeEstimator: newMockFeeEstimator(),
+		feeEstimator: feeEstimator,
 		globalPolicy: globalPolicy,
 		obfuscator:   obfuscator,
 		defaultDelta: defaultDelta,
@@ -1147,7 +1173,6 @@ func (h *hopNetwork) createChannelLink(server, peer *mockServer,
 			OutgoingCltvRejectDelta: 3,
 			MaxOutgoingCltvExpiry:   DefaultMaxOutgoingCltvExpiry,
 			MaxFeeAllocation:        DefaultMaxLinkFeeAllocation,
-			MaxAnchorsCommitFeeRate: chainfee.SatPerKVByte(10 * 1000).FeePerKWeight(),
 			NotifyActiveLink:        func(wire.OutPoint) {},
 			NotifyActiveChannel:     func(wire.OutPoint) {},
 			NotifyInactiveChannel:   func(wire.OutPoint) {},
@@ -1303,15 +1328,10 @@ func (n *twoHopNetwork) makeHoldPayment(sendingPeer, receivingPeer lnpeer.Peer,
 
 	rhash := preimage.Hash()
 
-	var payAddr [32]byte
-	if _, err := crand.Read(payAddr[:]); err != nil {
-		panic(err)
-	}
-
 	// Generate payment: invoice and htlc.
 	invoice, htlc, pid, err := generatePaymentWithPreimage(
 		invoiceAmt, htlcAmt, timelock, blob,
-		nil, rhash, payAddr,
+		channeldb.UnknownPreimage, rhash,
 	)
 	if err != nil {
 		paymentErr <- err
@@ -1375,7 +1395,7 @@ func timeout(t *testing.T) func() {
 	done := make(chan struct{})
 	go func() {
 		select {
-		case <-time.After(20 * time.Second):
+		case <-time.After(10 * time.Second):
 			pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
 
 			panic("test timeout")
